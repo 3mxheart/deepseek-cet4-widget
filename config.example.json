@@ -1,0 +1,38 @@
+{
+  "deepseek_api_key": "",
+  "api_base": "https://api.deepseek.com",
+  "use_system_proxy": true,
+  "balance_refresh_seconds": 30,
+  "show_delta": true,
+  "delta_hold_seconds": 600,
+  "show_status_line": true,
+  "exams": [
+    { "name": "CET-4", "datetime": "2026-12-12 09:00" },
+    { "name": "CET-4", "datetime": "2027-06-12 09:00" }
+  ],
+  "background_image": "",
+  "window": {
+    "width": 360,
+    "height": 112,
+    "x": null,
+    "y": null,
+    "opacity": 0.95,
+    "rounded": 20,
+    "topmost": true,
+    "transparent": true
+  },
+  "appearance": {
+    "scrim_alpha": 110,
+    "text_shadow": true,
+    "font_family": "Microsoft YaHei UI",
+    "value_size": 30,
+    "label_size": 12,
+    "detail_size": 12,
+    "label_color": "#8FA6BF",
+    "value_color": "#FFFFFF",
+    "detail_color": "#A8B8C8",
+    "accent_color": "#4C8DFF"
+  },
+  "lock_position": false,
+  "show_balance_detail": true
+}

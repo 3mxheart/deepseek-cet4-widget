@@ -1,0 +1,21 @@
+# 个人配置与运行时产物：config.json 里存着 API Key，绝对不能提交
+config.json
+widget.log
+*.log
+
+# 编译产物
+*.exe
+*.o
+*.res
+build/
+dist/
+
+# 便携编译工具链（约 900MB，按需自行下载）
+tools/
+
+# Python / 编辑器杂物
+__pycache__/
+*.pyc
+.vs/
+.vscode/
+*.user
