@@ -21,8 +21,9 @@ using namespace Gdiplus;
 
 enum {
     IDM_REFRESH = 1001, IDM_SETKEY, IDM_OPENFOLDER, IDM_EDITCFG, IDM_PICKBG,
-    IDM_CLEARBG, IDM_OPACITY_UP, IDM_OPACITY_DOWN, IDM_LOCK, IDM_STARTUP, IDM_EXIT,
-    IDM_HIDE,
+    IDM_CLEARBG, IDM_PICKTRAY, IDM_DEFAULTTRAY,
+    IDM_OPACITY_UP, IDM_OPACITY_DOWN, IDM_LOCK, IDM_STARTUP, IDM_EXIT,
+    IDM_HIDE, IDM_ONLY_CHARGED,
     IDM_FREQ_BASE = 1100,
     IDM_IDC_KEY_OK = 1200, IDM_IDC_KEY_CANCEL
 };
@@ -37,18 +38,26 @@ static HANDLE     g_thread, g_ev_refresh, g_ev_stop;
 static CRITICAL_SECTION g_lock;
 static ULONG_PTR  g_gdiplus;
 
-static char       g_currency[16] = "CNY";
-static char       g_total[64] = "";
-static char       g_granted[32] = "";
-static char       g_topped[32] = "";
-static char       g_error[512] = "";
-static int        g_has_balance = 0;
-static int        g_loading = 1;
-static int        g_has_updated = 0, g_has_attempt = 0;
-static SYSTEMTIME g_updated_at, g_attempt_at;
-static double     g_delta = 0;
-static int        g_has_delta = 0;
-static SYSTEMTIME g_delta_at;
+/* 每个服务商的运行状态（配置在 g_cfg.providers，这里只放易变的读数） */
+typedef struct {
+    int        has_total;
+    char       total[64];      /* 接口原样返回的金额字符串 */
+    char       prefix[16];     /* ¥ / $ */
+    char       extra[128];     /* 副标题：赠送 / 充值 / 已用 */
+    int        has_error;
+    char       error[256];
+    int        has_updated;
+    SYSTEMTIME updated_at;
+    time_t     charged_at;     /* 最近一次“掉钱”的时间，0 = 没掉过 */
+    double     last_delta;     /* 最近一次变化量（负数） */
+    int        has_delta;
+} PState;
+
+static PState     g_ps[CW_MAX_PROVIDERS];
+static int        g_rows[CW_MAX_PROVIDERS];
+static int        g_row_count = 0;
+static int        g_any_attempt = 0;
+static SYSTEMTIME g_attempt_at;
 
 static HBITMAP    g_dib = NULL;
 static void      *g_bits = NULL;
@@ -109,76 +118,132 @@ static long long seconds_between(const SYSTEMTIME *a, const SYSTEMTIME *b)
 }
 
 /* ---------------------------------------------------------------- 文案组装 */
+#define CW_MAX_ROWS 4
+
 typedef struct {
-    char value[64];
-    char detail[512];
+    char name[40];
+    char value[64];      /* 已带币种前缀，如 "$2.11" */
+    char delta[24];      /* "-0.07" */
+    int  delta_up;
+    char extra[128];
+    int  gray;
+} Row;
+
+typedef struct {
+    Row  rows[CW_MAX_ROWS];
+    int  row_count;
     char cd_value[32];
     char cd_detail[80];
     char status[192];
-    char delta[24];
-    int  delta_up;
-    int  value_gray;
 } Texts;
+
+/* 选出要显示哪几行：默认只显示“最近扣过钱”的服务商 */
+static void pick_rows(const PState *ps, int count, time_t now, int rows[], int *row_count)
+{
+    *row_count = 0;
+    if (!g_cfg.show_only_charged) {
+        for (int i = 0; i < count && *row_count < CW_MAX_ROWS; i++)
+            if (g_cfg.providers[i].enabled) rows[(*row_count)++] = i;
+    } else {
+        long hold = (long)g_cfg.charged_hold_minutes * 60;
+        int picked[CW_MAX_PROVIDERS];
+        long long age[CW_MAX_PROVIDERS];
+        int n = 0;
+        for (int i = 0; i < count && i < CW_MAX_PROVIDERS; i++) {
+            if (!g_cfg.providers[i].enabled || ps[i].charged_at == 0) continue;
+            long long a = (long long)(now - ps[i].charged_at);
+            if (hold > 0 && a > hold) continue;
+            picked[n] = i;
+            age[n] = a;
+            n++;
+        }
+        /* 最近扣的排最前（插入排序，最多 6 个） */
+        for (int i = 1; i < n; i++) {
+            int key = picked[i];
+            long long ka = age[i];
+            int j = i - 1;
+            while (j >= 0 && age[j] > ka) {
+                picked[j + 1] = picked[j];
+                age[j + 1] = age[j];
+                j--;
+            }
+            picked[j + 1] = key;
+            age[j + 1] = ka;
+        }
+        for (int i = 0; i < n && *row_count < CW_MAX_ROWS; i++)
+            rows[(*row_count)++] = picked[i];
+    }
+    /* 一家都没扣过钱：退回显示第一家，窗口不会空着 */
+    if (*row_count == 0 && count > 0) {
+        int first = -1;
+        for (int i = 0; i < count; i++)
+            if (g_cfg.providers[i].enabled) { first = i; break; }
+        rows[(*row_count)++] = (first >= 0) ? first : 0;
+    }
+}
 
 static void build_texts(Texts *t)
 {
     memset(t, 0, sizeof(*t));
     SYSTEMTIME now;
     GetLocalTime(&now);
+    time_t nowt = time(NULL);
 
+    PState ps[CW_MAX_PROVIDERS];
+    int count = g_cfg.provider_count;
+    if (count > CW_MAX_PROVIDERS) count = CW_MAX_PROVIDERS;
     EnterCriticalSection(&g_lock);
-    int has = g_has_balance, loading = g_loading;
-    char total[64], cur[16], gr[32], tp[32], err[512];
-    lstrcpynA(total, g_total, sizeof(total));
-    lstrcpynA(cur, g_currency, sizeof(cur));
-    lstrcpynA(gr, g_granted, sizeof(gr));
-    lstrcpynA(tp, g_topped, sizeof(tp));
-    lstrcpynA(err, g_error, sizeof(err));
-    int has_upd = g_has_updated, has_att = g_has_attempt, has_delta = g_has_delta;
-    double delta = g_delta;
-    SYSTEMTIME updated = g_updated_at, attempt = g_attempt_at, dat = g_delta_at;
+    memcpy(ps, g_ps, sizeof(g_ps));
+    int any_attempt = g_any_attempt;
+    SYSTEMTIME attempt = g_attempt_at;
     LeaveCriticalSection(&g_lock);
 
-    if (has) {
-        const char *sym = "\xc2\xa5";               /* ¥ (UTF-8) */
-        if (lstrcmpiA(cur, "USD") == 0) sym = "$";
-        else if (lstrcmpiA(cur, "EUR") == 0) sym = "\xe2\x82\xac";
-        cw_fmt(t->value, sizeof(t->value), "%s%s", sym, total);
-        char parts[256] = "";
-        if (gr[0] && strcmp(gr, "0.00") != 0 && strcmp(gr, "0") != 0)
-            cw_fmt(parts + strlen(parts), (int)sizeof(parts) - (int)strlen(parts), "赠送 %s", gr);
-        if (tp[0] && strcmp(tp, "0.00") != 0 && strcmp(tp, "0") != 0) {
-            if (parts[0]) strcat(parts, " · ");
-            cw_fmt(parts + strlen(parts), (int)sizeof(parts) - (int)strlen(parts), "充值 %s", tp);
+    pick_rows(ps, count, nowt, g_rows, &g_row_count);
+
+    for (int r = 0; r < g_row_count; r++) {
+        int i = g_rows[r];
+        const Provider *p = &g_cfg.providers[i];
+        Row *row = &t->rows[t->row_count++];
+        lstrcpynA(row->name, p->name, sizeof(row->name));
+        if (ps[i].has_total) {
+            cw_fmt(row->value, sizeof(row->value), "%s%s", ps[i].prefix, ps[i].total);
+            if (ps[i].has_error) lstrcpynA(row->extra, "刷新失败，显示上次读数", sizeof(row->extra));
+            else                  lstrcpynA(row->extra, ps[i].extra, sizeof(row->extra));
+        } else if (ps[i].has_error) {
+            lstrcpynA(row->value, "--", sizeof(row->value));
+            lstrcpynA(row->extra, ps[i].error, sizeof(row->extra));
+            row->gray = 1;
+        } else {
+            lstrcpynA(row->value, "…", sizeof(row->value));
+            lstrcpynA(row->extra, "正在查询…", sizeof(row->extra));
         }
-        lstrcpynA(t->detail, parts[0] ? parts : "账户余额", sizeof(t->detail));
-    } else if (loading) {
-        lstrcpynA(t->value, "…", sizeof(t->value));
-        lstrcpynA(t->detail, "正在查询余额…", sizeof(t->detail));
-    } else {
-        lstrcpynA(t->value, "--", sizeof(t->value));
-        lstrcpynA(t->detail, err[0] ? err : "余额未知", sizeof(t->detail));
-        t->value_gray = 1;
+        if (!g_cfg.show_balance_detail) row->extra[0] = 0;
+        if (g_cfg.show_delta && ps[i].has_delta) {
+            long long age = (long long)(nowt - ps[i].charged_at);
+            if (g_cfg.delta_hold_seconds <= 0 || age <= g_cfg.delta_hold_seconds) {
+                cw_fmt(row->delta, sizeof(row->delta), "%+.2f", ps[i].last_delta);
+                row->delta_up = (ps[i].last_delta > 0);
+            }
+        }
     }
-    if (!g_cfg.show_balance_detail) t->detail[0] = 0;
 
     cw_countdown(t->cd_value, sizeof(t->cd_value), t->cd_detail, sizeof(t->cd_detail));
 
-    if (has_delta && g_cfg.show_delta) {
-        long long age = seconds_between(&dat, &now);
-        if (g_cfg.delta_hold_seconds <= 0 || age <= g_cfg.delta_hold_seconds) {
-            cw_fmt(t->delta, sizeof(t->delta), "刚 %+.2f", delta);
-            t->delta_up = (delta > 0);
-        }
+    /* 底部状态行用“最新一次成功刷新”的时间 */
+    int best = -1;
+    long long best_age = 0;
+    for (int i = 0; i < count; i++) {
+        if (!ps[i].has_updated) continue;
+        long long a = seconds_between(&ps[i].updated_at, &now);
+        if (best < 0 || a < best_age) { best = i; best_age = a; }
     }
-
     if (g_cfg.show_status_line) {
         char every[32], t1[16];
         interval_text(every, sizeof(every));
-        if (has && has_upd) {
-            hhmmss(&updated, t1, sizeof(t1));
+        if (best >= 0) {
+            hhmmss(&ps[best].updated_at, t1, sizeof(t1));
             cw_fmt(t->status, sizeof(t->status), "更新于 %s · %s刷新", t1, every);
-        } else if (err[0] && has_att) {
+        } else if (any_attempt) {
             hhmmss(&attempt, t1, sizeof(t1));
             cw_fmt(t->status, sizeof(t->status), "刷新失败 %s · %s重试", t1, every);
         } else {
@@ -385,12 +450,20 @@ static void ensure_surface(int W, int H)
 
 static void render(void)
 {
-    int W = g_cfg.w, H = g_cfg.h;
-    ensure_surface(W, H);
-    if (!g_bits) return;
-
     Texts t;
     build_texts(&t);
+
+    int W = g_cfg.w;
+    int H = 84 + 28 * t.row_count;   /* 显示几行，窗口就多高（配置里的 height 作为下限） */
+    if (H < g_cfg.h) H = g_cfg.h;
+
+    RECT wrc;
+    GetWindowRect(g_hwnd, &wrc);
+    if ((wrc.bottom - wrc.top) != H || (wrc.right - wrc.left) != W)
+        SetWindowPos(g_hwnd, NULL, 0, 0, W, H, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+    ensure_surface(W, H);
+    if (!g_bits) return;
 
     {
         Bitmap bmp(W, H, W * 4, PixelFormat32bppPARGB, (BYTE *)g_bits);
@@ -408,69 +481,61 @@ static void render(void)
         cw_hex_to_rgb(g_cfg.value_color, &vr, &vg, &vb, 255, 255, 255);
         cw_hex_to_rgb(g_cfg.detail_color, &dr, &dg, &db, 168, 184, 200);
         Color c_label(lr, lg, lb), c_value(vr, vg, vb), c_detail(dr, dg, db);
-        if (t.value_gray) c_value = c_label;
-
-        float pad = 16.0f, gap = 10.0f;
-        float col_w = ((float)W - 2.0f * pad - gap) / 2.0f;
+        float pad = 16.0f;
         float label_sz = (float)g_cfg.label_size;
         float value_sz = (float)g_cfg.value_size;
         float detail_sz = (float)g_cfg.detail_size;
-        float label_h = label_sz + 4.0f, value_h = value_sz + 6.0f, detail_h = detail_sz + 4.0f;
-        float vgap = 3.0f;
-        float block_h = label_h + vgap + value_h + vgap + detail_h;
-        float status_h = t.status[0] ? (detail_sz + 4.0f) : 0.0f;
-        float top = (float)H - status_h - block_h;
-        top = (top / 2.0f > pad * 0.4f) ? top / 2.0f : pad * 0.4f;
-        float y_label = top;
-        float y_value = y_label + label_h + vgap;
-        float y_detail = y_value + value_h + vgap;
+        float y = 8.0f;
 
-        /* 左栏：余额 */
-        RectF r_label(pad, y_label, col_w, label_h);
-        draw_line(&g, "DeepSeek 余额", &r_label, label_sz, FALSE, c_label,
-                  StringAlignmentNear, TRUE);
-        if (t.delta[0]) {
-            float lw = measure_text(&g, "DeepSeek 余额", label_sz, FALSE);
-            float dx = pad + lw + 2.0f;
-            float room = col_w - (dx - pad);
-            if (room > 10.0f) {
-                Color c_delta = t.delta_up ? Color(126, 217, 160) : Color(255, 156, 156);
-                RectF r_delta(dx, y_label, room, label_h);
-                draw_line(&g, t.delta, &r_delta, label_sz, FALSE, c_delta,
-                          StringAlignmentNear, TRUE);
+        /* 服务商逐行：名字 + 变化量 在左，金额靠右 */
+        for (int r = 0; r < t.row_count; r++) {
+            Row *row = &t.rows[r];
+            RectF rn(pad, y + 7.0f, 170.0f, label_sz + 8.0f);
+            draw_line(&g, row->name, &rn, label_sz, FALSE, c_label,
+                      StringAlignmentNear, TRUE);
+            if (row->delta[0]) {
+                float nw = measure_text(&g, row->name, label_sz, FALSE);
+                float dx = pad + nw + 6.0f;
+                if (dx < (float)W - 90.0f) {
+                    Color c_delta = row->delta_up ? Color(126, 217, 160)
+                                                  : Color(255, 156, 156);
+                    RectF rd(dx, y + 7.0f, 86.0f, label_sz + 8.0f);
+                    draw_line(&g, row->delta, &rd, label_sz, FALSE, c_delta,
+                              StringAlignmentNear, TRUE);
+                }
             }
+            RectF rv(pad, y - 1.0f, (float)W - 2.0f * pad, value_sz + 10.0f);
+            draw_line(&g, row->value, &rv, value_sz, TRUE,
+                      row->gray ? c_label : c_value, StringAlignmentFar, TRUE);
+            y += 28.0f;
         }
-        RectF r_value(pad, y_value, col_w, value_h);
-        draw_line(&g, t.value, &r_value, value_sz, TRUE, c_value, StringAlignmentNear, TRUE);
-        RectF r_detail(pad, y_detail, col_w, detail_h);
-        draw_line(&g, t.detail, &r_detail, detail_sz, FALSE, c_detail,
-                  StringAlignmentNear, TRUE);
 
-        /* 右栏：倒计时 */
-        float rx = pad + col_w + gap;
+        /* 分隔线 */
+        Pen pen(Color(38, 255, 255, 255), 1.0f);
+        g.DrawLine(&pen, pad, y + 5.0f, (float)W - pad, y + 5.0f);
+
+        /* 倒计时一行：左边标题+开考时间，右边大字 */
         char exam_label[64];
         cw_fmt(exam_label, sizeof(exam_label), "%s 倒计时",
                g_cfg.exam_count > 0 ? g_cfg.exams[0].name : "考试");
-        RectF r2_label(rx, y_label, col_w, label_h);
-        draw_line(&g, exam_label, &r2_label, label_sz, FALSE, c_label,
+        float cy = y + 12.0f;
+        RectF cl(pad, cy, 200.0f, label_sz + 8.0f);
+        draw_line(&g, exam_label, &cl, label_sz, FALSE, c_label,
                   StringAlignmentNear, TRUE);
-        RectF r2_value(rx, y_value, col_w, value_h);
-        draw_line(&g, t.cd_value, &r2_value, value_sz, TRUE, c_value,
-                  StringAlignmentNear, TRUE);
-        RectF r2_detail(rx, y_detail, col_w, detail_h);
-        draw_line(&g, t.cd_detail, &r2_detail, detail_sz, FALSE, c_detail,
-                  StringAlignmentNear, TRUE);
-
-        /* 分隔线 */
-        float line_x = pad + col_w + gap / 2.0f;
-        Pen pen(Color(38, 255, 255, 255), 1.0f);
-        g.DrawLine(&pen, line_x, y_label, line_x, y_label + block_h);
+        if (t.cd_detail[0]) {
+            RectF cd(pad, cy + 16.0f, 210.0f, detail_sz + 4.0f);
+            draw_line(&g, t.cd_detail, &cd, detail_sz - 1.0f, FALSE, c_detail,
+                      StringAlignmentNear, TRUE);
+        }
+        RectF cv(pad, cy - 5.0f, (float)W - 2.0f * pad, value_sz + 10.0f);
+        draw_line(&g, t.cd_value, &cv, value_sz, TRUE, c_value,
+                  StringAlignmentFar, TRUE);
 
         /* 底部状态行 */
         if (t.status[0]) {
-            float ys = (float)H - pad * 0.45f - detail_sz;
-            RectF r_status(pad, ys, (float)W - 2.0f * pad, detail_h);
-            draw_line(&g, t.status, &r_status, detail_sz, FALSE, c_label,
+            RectF rs(pad, (float)H - 12.0f - detail_sz, (float)W - 2.0f * pad,
+                     detail_sz + 6.0f);
+            draw_line(&g, t.status, &rs, detail_sz, FALSE, c_label,
                       StringAlignmentCenter, TRUE);
         }
         g.Flush();
@@ -492,10 +557,15 @@ static void render_if_changed(int force)
 {
     Texts t;
     build_texts(&t);
-    char key[1024];
-    cw_fmt(key, sizeof(key), "%s|%s|%s|%s|%s|%s|%d|%d|%d|%d",
-           t.value, t.detail, t.cd_value, t.cd_detail, t.status, t.delta,
-           g_cfg.w, g_cfg.h, g_cfg.value_size, g_cfg.rounded);
+    char key[2048];
+    cw_fmt(key, sizeof(key), "%d|%s|%s|%s|%d|%d|%d",
+           t.row_count, t.cd_value, t.cd_detail, t.status,
+           g_cfg.w, g_cfg.h, g_cfg.value_size);
+    for (int r = 0; r < t.row_count; r++) {
+        size_t n = strlen(key);
+        cw_fmt(key + n, (int)(sizeof(key) - n), "|%s=%s(%s)%s",
+               t.rows[r].name, t.rows[r].value, t.rows[r].delta, t.rows[r].extra);
+    }
     if (!force && strcmp(key, g_last_key) == 0) return;
     lstrcpynA(g_last_key, key, sizeof(g_last_key));
     render();
@@ -532,34 +602,66 @@ static HFONT ui_font(void)
     return f;
 }
 
+/* 把下拉框里选中的服务商的 Key 读进输入框 */
+static void dlg_load_key(HWND h)
+{
+    HWND combo = GetDlgItem(h, 2);
+    int sel = combo ? (int)SendMessageW(combo, CB_GETCURSEL, 0, 0) : 0;
+    if (sel < 0 || sel >= g_cfg.provider_count) sel = 0;
+    wchar_t *kw = cw_w_from_u8(g_cfg.providers[sel].api_key);
+    HWND ed = GetDlgItem(h, 1);
+    if (ed) SetWindowTextW(ed, kw ? kw : L"");
+    free(kw);
+}
+
 static LRESULT CALLBACK KeyDlgProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
     case WM_CREATE: {
-        HWND lab = CreateWindowExW(0, L"STATIC",
-                                   L"把 DeepSeek API Key 粘贴到这里（形如 sk-xxxxxxxx）",
-                                   WS_CHILD | WS_VISIBLE, 16, 14, 430, 20, h, NULL, g_inst, NULL);
-        wchar_t *cur = cw_w_from_u8(g_cfg.api_key);
-        HWND ed = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", cur ? cur : L"",
+        HWND lab1 = CreateWindowExW(0, L"STATIC", L"服务商",
+                                    WS_CHILD | WS_VISIBLE, 16, 14, 60, 20, h, NULL, g_inst, NULL);
+        HWND combo = CreateWindowExW(0, L"COMBOBOX", L"",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
+                                     CBS_DROPDOWNLIST,
+                                     80, 10, 366, 240, h, (HMENU)2, g_inst, NULL);
+        for (int i = 0; i < g_cfg.provider_count; i++) {
+            wchar_t *wn = cw_w_from_u8(g_cfg.providers[i].name);
+            SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)(wn ? wn : L"?"));
+            free(wn);
+        }
+        SendMessageW(combo, CB_SETCURSEL, 0, 0);
+
+        HWND lab2 = CreateWindowExW(0, L"STATIC", L"API Key",
+                                    WS_CHILD | WS_VISIBLE, 16, 46, 60, 20, h, NULL, g_inst, NULL);
+        HWND ed = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD,
-                                  16, 40, 430, 26, h, (HMENU)1, g_inst, NULL);
-        free(cur);
+                                  16, 68, 430, 26, h, (HMENU)1, g_inst, NULL);
         HWND hint = CreateWindowExW(0, L"STATIC",
-                                    L"保存后会立刻查一次余额，结果显示在悬浮窗上",
-                                    WS_CHILD | WS_VISIBLE, 16, 74, 430, 20, h, NULL, g_inst, NULL);
+                                    L"点“保存并测试”会立刻查一次；要加别的服务商，"
+                                    L"在 config.json 的 providers 里添一项（type 可填 http）",
+                                    WS_CHILD | WS_VISIBLE, 16, 100, 430, 34, h, NULL, g_inst, NULL);
         HWND ok = CreateWindowExW(0, L"BUTTON", L"保存并测试",
                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                                  226, 104, 104, 30, h, (HMENU)IDM_IDC_KEY_OK, g_inst, NULL);
+                                  226, 140, 104, 30, h, (HMENU)IDM_IDC_KEY_OK, g_inst, NULL);
         HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消",
                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                      342, 104, 104, 30, h, (HMENU)IDM_IDC_KEY_CANCEL, g_inst, NULL);
-        HWND all[5] = { lab, ed, hint, ok, cancel };
-        for (int i = 0; i < 5; i++) SendMessageW(all[i], WM_SETFONT, (WPARAM)ui_font(), TRUE);
+                                      342, 140, 104, 30, h, (HMENU)IDM_IDC_KEY_CANCEL, g_inst, NULL);
+        HWND all[6] = { lab1, combo, lab2, ed, hint, ok };
+        for (int i = 0; i < 6; i++) SendMessageW(all[i], WM_SETFONT, (WPARAM)ui_font(), TRUE);
+        SendMessageW(cancel, WM_SETFONT, (WPARAM)ui_font(), TRUE);
+        dlg_load_key(h);
         SetFocus(ed);
         return 0;
     }
     case WM_COMMAND:
+        if (LOWORD(w) == 2 && HIWORD(w) == CBN_SELCHANGE) {
+            dlg_load_key(h);
+            return 0;
+        }
         if (LOWORD(w) == IDM_IDC_KEY_OK) {
+            HWND combo = GetDlgItem(h, 2);
+            int sel = (int)SendMessageW(combo, CB_GETCURSEL, 0, 0);
+            if (sel < 0 || sel >= g_cfg.provider_count) sel = 0;
             HWND ed = GetDlgItem(h, 1);
             int len = GetWindowTextLengthW(ed);
             wchar_t *buf = (wchar_t *)malloc((size_t)(len + 2) * sizeof(wchar_t));
@@ -571,7 +673,8 @@ static LRESULT CALLBACK KeyDlgProc(HWND h, UINT m, WPARAM w, LPARAM l)
                     size_t n = strlen(u8);
                     while (n > 0 && (u8[n - 1] == ' ' || u8[n - 1] == '\r' || u8[n - 1] == '\n'))
                         u8[--n] = 0;
-                    lstrcpynA(g_cfg.api_key, u8, sizeof(g_cfg.api_key));
+                    lstrcpynA(g_cfg.providers[sel].api_key, u8,
+                              sizeof(g_cfg.providers[sel].api_key));
                     free(u8);
                     g_key_changed = 1;
                 }
@@ -597,9 +700,9 @@ static void show_key_dialog(void)
     GetWindowRect(g_hwnd, &rc);
     g_key_changed = 0;
     g_keydlg = CreateWindowExW(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME, L"CWKeyDlg",
-                               L"设置 DeepSeek API Key",
+                               L"设置 API Key",
                                WS_POPUP | WS_CAPTION | WS_SYSMENU,
-                               rc.left - 60, rc.top + 40, 470, 180,
+                               rc.left - 60, rc.top + 40, 470, 215,
                                g_hwnd, NULL, g_inst, NULL);
     if (!g_keydlg) {
         cw_log("设置对话框创建失败: %lu", GetLastError());
@@ -658,6 +761,119 @@ static void toggle_visible(void)
     cw_log("悬浮窗 -> %s", g_hidden ? "隐藏" : "显示");
 }
 
+/* ---- 托盘图标本身：默认资源图标，也可指定 .ico / .png ---- */
+static HICON g_icon_file = NULL;   /* 从文件加载的图标，需要 DestroyIcon */
+
+/* PNG/BMP → 32×32 带 alpha 的 HICON */
+static HICON icon_from_image(const wchar_t *path)
+{
+    Bitmap src(path);
+    if (src.GetLastStatus() != Ok || src.GetWidth() <= 0) return NULL;
+
+    const int S = 32;
+    Bitmap scaled(S, S, PixelFormat32bppARGB);
+    {
+        Graphics g(&scaled);
+        g.SetCompositingMode(CompositingModeSourceOver);
+        g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+        g.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+        g.Clear(Color(0, 0, 0, 0));
+        g.DrawImage(&src, 0, 0, S, S);
+    }
+
+    Rect rc(0, 0, S, S);
+    BitmapData bd;
+    if (scaled.LockBits(&rc, ImageLockModeRead, PixelFormat32bppARGB, &bd) != Ok) return NULL;
+
+    BITMAPV5HEADER bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.bV5Size = sizeof(BITMAPV5HEADER);
+    bi.bV5Width = S;
+    bi.bV5Height = -S;
+    bi.bV5Planes = 1;
+    bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00FF0000;
+    bi.bV5GreenMask = 0x0000FF00;
+    bi.bV5BlueMask = 0x000000FF;
+    bi.bV5AlphaMask = 0xFF000000;
+
+    HDC hdc = GetDC(NULL);
+    void *bits = NULL;
+    HBITMAP hbm = CreateDIBSection(hdc, (BITMAPINFO *)&bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    HICON hIcon = NULL;
+    if (hbm && bits) {
+        for (int y = 0; y < S; y++)
+            memcpy((BYTE *)bits + (size_t)y * S * 4,
+                   (BYTE *)bd.Scan0 + (size_t)y * bd.Stride, (size_t)S * 4);
+        HBITMAP hMask = CreateBitmap(S, S, 1, 1, NULL);
+        ICONINFO ii;
+        memset(&ii, 0, sizeof(ii));
+        ii.fIcon = TRUE;
+        ii.hbmMask = hMask;
+        ii.hbmColor = hbm;
+        hIcon = CreateIconIndirect(&ii);
+        if (hMask) DeleteObject(hMask);
+    }
+    scaled.UnlockBits(&bd);
+    if (hbm) DeleteObject(hbm);
+    ReleaseDC(NULL, hdc);
+    return hIcon;
+}
+
+static HICON build_tray_icon(void)
+{
+    if (g_icon_file) { DestroyIcon(g_icon_file); g_icon_file = NULL; }
+    if (g_cfg.tray_icon[0]) {
+        wchar_t *wp = cw_w_from_u8(g_cfg.tray_icon);
+        if (wp) {
+            HICON h = (HICON)LoadImageW(NULL, wp, IMAGE_ICON, 0, 0,
+                                        LR_LOADFROMFILE | LR_DEFAULTSIZE);
+            if (!h) h = icon_from_image(wp);
+            if (h) g_icon_file = h;
+            else   cw_log("托盘图标加载失败，改用内置图标: %s", g_cfg.tray_icon);
+            free(wp);
+        }
+    }
+    if (g_icon_file) return g_icon_file;
+    HICON res = LoadIconW(g_inst, MAKEINTRESOURCEW(1));
+    return res ? res : LoadIconW(NULL, IDI_APPLICATION);
+}
+
+static void tray_apply_icon(void)
+{
+    HICON h = build_tray_icon();
+    if (!h || !g_nid.hWnd) return;
+    g_nid.hIcon = h;
+    g_nid.uFlags = NIF_ICON;
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+}
+
+static void pick_tray_icon(void)
+{
+    wchar_t file[MAX_PATH] = {0};
+    OPENFILENAMEW ofn;
+    memset(&ofn, 0, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_hwnd;
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = L"选择托盘图标（.ico 最清晰，.png 会缩放到 32×32）";
+    ofn.lpstrFilter = L"图标 (*.ico;*.png;*.bmp)\0*.ico;*.png;*.bmp\0所有文件\0*.*\0\0";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (GetOpenFileNameW(&ofn)) {
+        char *u8 = cw_u8_from_w(file);
+        if (u8) {
+            lstrcpynA(g_cfg.tray_icon, u8, sizeof(g_cfg.tray_icon));
+            free(u8);
+            cw_save_config();
+            tray_apply_icon();
+            cw_log("托盘图标已更换: %s", g_cfg.tray_icon);
+        }
+    }
+}
+
 static void tray_add(void)
 {
     memset(&g_nid, 0, sizeof(g_nid));
@@ -666,8 +882,7 @@ static void tray_add(void)
     g_nid.uID = TRAY_ID;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_CW_TRAY;
-    g_nid.hIcon = LoadIconW(g_inst, MAKEINTRESOURCEW(1));
-    if (!g_nid.hIcon) g_nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    g_nid.hIcon = build_tray_icon();
     lstrcpynW(g_nid.szTip, L"DeepSeek 余额 / CET-4 倒计时", 128);
     if (!Shell_NotifyIconW(NIM_ADD, &g_nid)) {
         cw_log("托盘图标添加失败: %lu", GetLastError());
@@ -678,15 +893,12 @@ static void tray_add(void)
     cw_log("托盘图标已添加（若任务栏没看到，点任务栏的 ^ 折叠区把它拖出来）");
 }
 
-static void tray_tip(const char *value, const char *detail)
+static void tray_tip_text(const char *text)
 {
     if (!g_nid.hWnd) return;
-    wchar_t *wv = cw_w_from_u8(value);
-    wchar_t *wd = cw_w_from_u8(detail);
-    _snwprintf(g_nid.szTip, 128, L"DeepSeek %s · %s", wv ? wv : L"--", wd ? wd : L"");
-    g_nid.szTip[127] = 0;
-    free(wv);
-    free(wd);
+    wchar_t *w = cw_w_from_u8(text);
+    lstrcpynW(g_nid.szTip, (w && w[0]) ? w : L"DeepSeek 余额", 128);
+    free(w);
     g_nid.uFlags = NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
@@ -705,6 +917,8 @@ static void show_menu(int trayMode)
     if (trayMode)
         AppendMenuW(menu, MF_STRING, IDM_HIDE, g_hidden ? L"显示悬浮窗" : L"隐藏悬浮窗");
     AppendMenuW(menu, MF_STRING, IDM_REFRESH, L"立即刷新余额（双击窗体同效）");
+    AppendMenuW(menu, MF_STRING | (g_cfg.show_only_charged ? MF_CHECKED : 0),
+                IDM_ONLY_CHARGED, L"只显示最近扣费的服务商");
     AppendMenuW(menu, MF_STRING, IDM_SETKEY, L"设置 API Key…");
     for (int i = 0; i < FREQ_COUNT; i++) {
         char label[32];
@@ -721,6 +935,8 @@ static void show_menu(int trayMode)
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, IDM_PICKBG, L"更换背景图片…");
     AppendMenuW(menu, MF_STRING, IDM_CLEARBG, L"恢复默认背景");
+    AppendMenuW(menu, MF_STRING, IDM_PICKTRAY, L"更换托盘图标…");
+    AppendMenuW(menu, MF_STRING, IDM_DEFAULTTRAY, L"恢复默认托盘图标");
     AppendMenuW(menu, MF_STRING, IDM_OPENFOLDER, L"打开所在文件夹");
     AppendMenuW(menu, MF_STRING, IDM_EDITCFG, L"编辑配置文件");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
@@ -762,6 +978,14 @@ static void show_menu(int trayMode)
         cw_save_config();
         render_if_changed(1);
         break;
+    case IDM_PICKTRAY:
+        pick_tray_icon();
+        break;
+    case IDM_DEFAULTTRAY:
+        g_cfg.tray_icon[0] = 0;
+        cw_save_config();
+        tray_apply_icon();
+        break;
     case IDM_OPENFOLDER:
         ShellExecuteW(NULL, L"open", g_dirw, NULL, NULL, SW_SHOWNORMAL);
         break;
@@ -789,6 +1013,11 @@ static void show_menu(int trayMode)
     }
     case IDM_HIDE:
         toggle_visible();
+        break;
+    case IDM_ONLY_CHARGED:
+        g_cfg.show_only_charged = !g_cfg.show_only_charged;
+        cw_save_config();
+        render_if_changed(1);
         break;
     case IDM_EXIT:
         DestroyWindow(g_hwnd);
@@ -862,12 +1091,23 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_CW_BALANCE: {
         Texts t;
         build_texts(&t);              /* 鼠标悬停托盘图标时也能看到余额 */
-        tray_tip(t.value, t.cd_value);
-        if (!g_hidden) render_if_changed(1);
+        char tip[220] = "";
+        for (int r = 0; r < t.row_count; r++) {
+            size_t n = strlen(tip);
+            cw_fmt(tip + n, (int)(sizeof(tip) - n), "%s%s %s",
+                   r ? " · " : "", t.rows[r].name, t.rows[r].value);
+        }
+        {
+            size_t n = strlen(tip);
+            cw_fmt(tip + n, (int)(sizeof(tip) - n), "%s%s", n ? " · " : "", t.cd_value);
+        }
+        tray_tip_text(tip);
+        if (!g_hidden) render_if_changed(0);
         return 0;
     }
     case WM_DESTROY:
         tray_remove();
+        if (g_icon_file) { DestroyIcon(g_icon_file); g_icon_file = NULL; }
         KillTimer(h, TIMER_TICK);
         if (g_ev_stop) SetEvent(g_ev_stop);
         if (g_thread) {
@@ -897,41 +1137,46 @@ static DWORD WINAPI WorkerProc(LPVOID)
         SYSTEMTIME attempt;
         GetLocalTime(&attempt);
         EnterCriticalSection(&g_lock);
-        g_has_attempt = 1;
+        g_any_attempt = 1;
         g_attempt_at = attempt;
-        if (!g_has_balance) g_loading = 1;
         LeaveCriticalSection(&g_lock);
 
-        char cur[16] = {0}, tot[64] = {0}, gr[32] = {0}, tp[32] = {0}, err[512] = {0};
-        int ok = cw_fetch_balance(g_cfg.api_key, g_cfg.api_base, g_cfg.use_proxy,
-                                  cur, sizeof(cur), tot, sizeof(tot),
-                                  gr, sizeof(gr), tp, sizeof(tp), err, sizeof(err));
-        EnterCriticalSection(&g_lock);
-        g_loading = 0;
-        if (ok) {
-            double nv = parse_total(tot);
-            double ov = parse_total(g_total);
-            if (g_has_balance && nv >= 0 && ov >= 0 && (nv - ov > 1e-9 || ov - nv > 1e-9)) {
-                g_delta = nv - ov;
-                g_has_delta = 1;
-                GetLocalTime(&g_delta_at);
+        /* 逐个服务商查，谁掉钱了谁就会被显示出来 */
+        for (int i = 0; i < g_cfg.provider_count && i < CW_MAX_PROVIDERS; i++) {
+            const Provider *p = &g_cfg.providers[i];
+            if (!p->enabled) continue;
+
+            char tot[64] = {0}, pfx[16] = {0}, extra[128] = {0}, err[256] = {0};
+            int ok = cw_provider_fetch(p, g_cfg.use_proxy, tot, sizeof(tot),
+                                       pfx, sizeof(pfx), extra, sizeof(extra),
+                                       err, sizeof(err));
+            EnterCriticalSection(&g_lock);
+            PState *st = &g_ps[i];
+            if (ok) {
+                double nv = parse_total(tot);
+                double ov = parse_total(st->total);
+                if (st->has_total && nv >= 0 && ov >= 0 && ov - nv > 0.0049) {
+                    st->last_delta = nv - ov;      /* 只有“掉钱”才算扣费 */
+                    st->has_delta = 1;
+                    st->charged_at = time(NULL);
+                }
+                lstrcpynA(st->total, tot, sizeof(st->total));
+                lstrcpynA(st->prefix, pfx, sizeof(st->prefix));
+                lstrcpynA(st->extra, extra, sizeof(st->extra));
+                st->has_error = 0;
+                st->has_total = 1;
+                GetLocalTime(&st->updated_at);
+                st->has_updated = 1;
+            } else {
+                lstrcpynA(st->error, err, sizeof(st->error));
+                st->has_error = 1;
             }
-            lstrcpynA(g_currency, cur[0] ? cur : "CNY", sizeof(g_currency));
-            lstrcpynA(g_total, tot, sizeof(g_total));
-            lstrcpynA(g_granted, gr, sizeof(g_granted));
-            lstrcpynA(g_topped, tp, sizeof(g_topped));
-            g_error[0] = 0;
-            g_has_balance = 1;
-            GetLocalTime(&g_updated_at);
-            g_has_updated = 1;
-        } else {
-            lstrcpynA(g_error, err, sizeof(g_error));
-        }
-        LeaveCriticalSection(&g_lock);
+            LeaveCriticalSection(&g_lock);
 
-        if (ok) cw_log("余额刷新成功: %s %s", cur, tot);
-        else    cw_log("余额刷新失败: %s", err);
-        PostMessageW(g_hwnd, WM_CW_BALANCE, 0, 0);
+            if (ok) cw_log("余额刷新成功: %s %s%s", p->name, pfx, tot);
+            else    cw_log("余额刷新失败: %s -> %s", p->name, err);
+            PostMessageW(g_hwnd, WM_CW_BALANCE, 0, 0);
+        }
     }
     return 0;
 }
@@ -950,7 +1195,8 @@ static void do_check(void)
 {
     cw_log("== 自检（原生 C 版）==");
     cw_log("程序目录: %s", g_dir);
-    cw_log("API Key : %s", g_cfg.api_key[0] ? "已设置" : "未设置");
+    cw_log("服务商  : %d 个（%s）", g_cfg.provider_count,
+           g_cfg.show_only_charged ? "只显示最近扣费的" : "显示全部");
     cw_log("背景图  : %s", g_cfg.bg_image[0] ? g_cfg.bg_image : "(默认渐变)");
     cw_log("刷新间隔: %d 秒", g_cfg.refresh_seconds);
     for (int i = 0; i < g_cfg.exam_count; i++) {
@@ -962,12 +1208,16 @@ static void do_check(void)
     }
     wchar_t as[1024];
     cw_log("开机自启动: %s", cw_autostart_get(as, 1024) ? "已开启" : "未开启");
-    char cur[16] = {0}, tot[64] = {0}, gr[32] = {0}, tp[32] = {0}, err[512] = {0};
-    int ok = cw_fetch_balance(g_cfg.api_key, g_cfg.api_base, g_cfg.use_proxy,
-                              cur, sizeof(cur), tot, sizeof(tot),
-                              gr, sizeof(gr), tp, sizeof(tp), err, sizeof(err));
-    if (ok) cw_log("余额测试: 成功 %s %s（赠送 %s / 充值 %s）", cur, tot, gr, tp);
-    else    cw_log("余额测试: 失败 %s", err);
+    for (int i = 0; i < g_cfg.provider_count; i++) {
+        const Provider *p = &g_cfg.providers[i];
+        char tot[64] = {0}, pfx[16] = {0}, extra[128] = {0}, err[256] = {0};
+        int ok = cw_provider_fetch(p, g_cfg.use_proxy, tot, sizeof(tot),
+                                   pfx, sizeof(pfx), extra, sizeof(extra),
+                                   err, sizeof(err));
+        cw_log("余额测试: %s (%s) -> %s", p->name, p->type, ok ? "成功" : "失败");
+        if (ok) cw_log("  %s%s  %s", pfx, tot, extra);
+        else    cw_log("  %s", err);
+    }
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int)

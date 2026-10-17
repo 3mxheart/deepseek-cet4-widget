@@ -192,6 +192,13 @@ static void defaults(void)
     g_cfg.delta_hold_seconds = 600;
     g_cfg.show_status_line = 1;
     g_cfg.show_balance_detail = 1;
+    g_cfg.show_only_charged = 1;
+    g_cfg.charged_hold_minutes = 60;
+    g_cfg.provider_count = 1;
+    memset(&g_cfg.providers[0], 0, sizeof(Provider));
+    lstrcpynA(g_cfg.providers[0].name, "DeepSeek", sizeof(g_cfg.providers[0].name));
+    lstrcpynA(g_cfg.providers[0].type, "deepseek", sizeof(g_cfg.providers[0].type));
+    g_cfg.providers[0].enabled = 1;
     g_cfg.w = 360;
     g_cfg.h = 112;
     g_cfg.opacity = 0.95;
@@ -272,6 +279,7 @@ void cw_load_config(void)
     g_cfg.show_status_line   = cw_jbool(buf, "show_status_line", g_cfg.show_status_line);
     g_cfg.show_balance_detail = cw_jbool(buf, "show_balance_detail", g_cfg.show_balance_detail);
     cw_jstr(buf, "background_image", g_cfg.bg_image, sizeof(g_cfg.bg_image));
+    cw_jstr(buf, "tray_icon", g_cfg.tray_icon, sizeof(g_cfg.tray_icon));
 
     const char *win = cw_jfind(buf, "window");
     if (win) {
@@ -298,6 +306,57 @@ void cw_load_config(void)
         cw_jstr(app, "accent_color", g_cfg.accent_color, sizeof(g_cfg.accent_color));
     }
     g_cfg.lock_position = cw_jbool(buf, "lock_position", 0);
+
+    /* 多服务商：默认只显示“最近扣过钱”的那家 */
+    g_cfg.show_only_charged    = cw_jbool(buf, "show_only_charged", g_cfg.show_only_charged);
+    g_cfg.charged_hold_minutes = cw_jint(buf, "charged_hold_minutes", g_cfg.charged_hold_minutes);
+    if (g_cfg.charged_hold_minutes < 0) g_cfg.charged_hold_minutes = 0;
+
+    const char *pv = cw_jfind(buf, "providers");
+    int have_providers = 0;
+    if (pv && *pv == '[') {
+        g_cfg.provider_count = 0;
+        const char *pp = pv;
+        while (*pp && g_cfg.provider_count < CW_MAX_PROVIDERS) {
+            const char *ob = strchr(pp, '{');
+            const char *cb = ob ? strchr(ob, '}') : NULL;
+            if (!ob || !cb) break;
+            int blen = (int)(cb - ob);
+            if (blen > 0 && blen < 4000) {
+                char *block = (char *)malloc((size_t)blen + 1);
+                if (!block) break;
+                memcpy(block, ob, (size_t)blen);
+                block[blen] = 0;
+                Provider *pr = &g_cfg.providers[g_cfg.provider_count];
+                memset(pr, 0, sizeof(*pr));
+                cw_jstr(block, "name", pr->name, sizeof(pr->name));
+                cw_jstr(block, "type", pr->type, sizeof(pr->type));
+                cw_jstr(block, "api_key", pr->api_key, sizeof(pr->api_key));
+                cw_jstr(block, "url", pr->url, sizeof(pr->url));
+                cw_jstr(block, "headers", pr->headers, sizeof(pr->headers));
+                cw_jstr(block, "json_path", pr->json_path, sizeof(pr->json_path));
+                cw_jstr(block, "prefix", pr->prefix, sizeof(pr->prefix));
+                pr->enabled = cw_jbool(block, "enabled", 1);
+                free(block);
+                if (!pr->type[0]) lstrcpynA(pr->type, "http", sizeof(pr->type));
+                if (!pr->name[0]) lstrcpynA(pr->name, pr->type, sizeof(pr->name));
+                g_cfg.provider_count++;
+            }
+            pp = cb + 1;
+        }
+        have_providers = (g_cfg.provider_count > 0);
+    }
+    /* 老配置兼容：没有 providers 就按 deepseek_api_key 造一个 */
+    if (!have_providers) {
+        g_cfg.provider_count = 1;
+        memset(&g_cfg.providers[0], 0, sizeof(Provider));
+        lstrcpynA(g_cfg.providers[0].name, "DeepSeek", sizeof(g_cfg.providers[0].name));
+        lstrcpynA(g_cfg.providers[0].type, "deepseek", sizeof(g_cfg.providers[0].type));
+        lstrcpynA(g_cfg.providers[0].api_key, g_cfg.api_key,
+                  sizeof(g_cfg.providers[0].api_key));
+        g_cfg.providers[0].enabled = 1;
+    }
+
     if (g_cfg.w < 160) g_cfg.w = 160;
     if (g_cfg.h < 72)  g_cfg.h = 72;
     if (g_cfg.opacity < 0.35) g_cfg.opacity = 0.35;
@@ -348,17 +407,35 @@ void cw_save_config(void)
     FILE *fp = _wfopen(path, L"wb");
     if (!fp) { cw_log("配置保存失败（目录不可写？）"); return; }
 
-    char key[1100], base[600], bg[2100], font[200];
-    cw_jesc(key, sizeof(key), g_cfg.api_key);
+    char base[600], bg[2100], font[200];
     cw_jesc(base, sizeof(base), g_cfg.api_base);
     cw_jesc(bg, sizeof(bg), g_cfg.bg_image);
     cw_jesc(font, sizeof(font), g_cfg.font_family);
 
     fprintf(fp, "{\n");
-    fprintf(fp, "  \"deepseek_api_key\": \"%s\",\n", key);
     fprintf(fp, "  \"api_base\": \"%s\",\n", base);
     fprintf(fp, "  \"use_system_proxy\": %s,\n", g_cfg.use_proxy ? "true" : "false");
     fprintf(fp, "  \"balance_refresh_seconds\": %d,\n", g_cfg.refresh_seconds);
+    fprintf(fp, "  \"show_only_charged\": %s,\n", g_cfg.show_only_charged ? "true" : "false");
+    fprintf(fp, "  \"charged_hold_minutes\": %d,\n", g_cfg.charged_hold_minutes);
+    fprintf(fp, "  \"providers\": [\n");
+    for (int i = 0; i < g_cfg.provider_count; i++) {
+        const Provider *p = &g_cfg.providers[i];
+        char nm[120], ty[40], k[1100], u[1100], h[1100], jp[300], px[40];
+        cw_jesc(nm, sizeof(nm), p->name);
+        cw_jesc(ty, sizeof(ty), p->type);
+        cw_jesc(k, sizeof(k), p->api_key);
+        cw_jesc(u, sizeof(u), p->url);
+        cw_jesc(h, sizeof(h), p->headers);
+        cw_jesc(jp, sizeof(jp), p->json_path);
+        cw_jesc(px, sizeof(px), p->prefix);
+        fprintf(fp, "    { \"name\": \"%s\", \"type\": \"%s\", \"api_key\": \"%s\", "
+                    "\"url\": \"%s\", \"headers\": \"%s\", \"json_path\": \"%s\", "
+                    "\"prefix\": \"%s\", \"enabled\": %s }%s\n",
+                nm, ty, k, u, h, jp, px, p->enabled ? "true" : "false",
+                (i == g_cfg.provider_count - 1) ? "" : ",");
+    }
+    fprintf(fp, "  ],\n");
     fprintf(fp, "  \"show_delta\": %s,\n", g_cfg.show_delta ? "true" : "false");
     fprintf(fp, "  \"delta_hold_seconds\": %d,\n", g_cfg.delta_hold_seconds);
     fprintf(fp, "  \"show_status_line\": %s,\n", g_cfg.show_status_line ? "true" : "false");
@@ -372,6 +449,11 @@ void cw_save_config(void)
     }
     fprintf(fp, "  ],\n");
     fprintf(fp, "  \"background_image\": \"%s\",\n", bg);
+    {
+        char ti[2100];
+        cw_jesc(ti, sizeof(ti), g_cfg.tray_icon);
+        fprintf(fp, "  \"tray_icon\": \"%s\",\n", ti);
+    }
     fprintf(fp, "  \"window\": {\n");
     fprintf(fp, "    \"width\": %d,\n    \"height\": %d,\n", g_cfg.w, g_cfg.h);
     if (g_cfg.has_pos) {
@@ -396,162 +478,6 @@ void cw_save_config(void)
     fprintf(fp, "  \"show_balance_detail\": %s\n", g_cfg.show_balance_detail ? "true" : "false");
     fprintf(fp, "}\n");
     fclose(fp);
-}
-
-/* ---------------------------------------------------------------- 查余额 */
-static void set_err(char *err, int cap, const char *msg)
-{
-    if (err && cap > 0) { lstrcpynA(err, msg, cap); }
-}
-
-/* 从响应体里取一个字符串字段（先找 CNY 那一段） */
-static int pick_str(const char *body, const char *field, char *out, int cap)
-{
-    out[0] = 0;
-    const char *zone = strstr(body, "\"CNY\"");
-    if (!zone) zone = body;
-    char pat[64];
-    _snprintf(pat, sizeof(pat), "\"%s\"", field);
-    pat[sizeof(pat) - 1] = 0;
-    const char *p = strstr(zone, pat);
-    if (!p) p = strstr(body, pat);
-    if (!p) return 0;
-    p = strchr(p + strlen(pat), ':');
-    if (!p) return 0;
-    p++;
-    while (*p == ' ') p++;
-    if (*p == '"') p++;
-    int i = 0;
-    while (*p && *p != '"' && *p != ',' && *p != '}' && i < cap - 1) out[i++] = *p++;
-    out[i] = 0;
-    return i > 0;
-}
-
-int cw_fetch_balance(const char *key, const char *base, int use_proxy,
-                     char *currency, int cap_cur,
-                     char *total, int cap_total,
-                     char *granted, int cap_granted,
-                     char *topped, int cap_topped,
-                     char *err, int cap_err)
-{
-    if (!key || !key[0]) { set_err(err, cap_err, "API Key 为空"); return 0; }
-    if (strncmp(key, "sk-", 3) != 0) {
-        char msg[256];
-        _snprintf(msg, sizeof(msg),
-                  "API Key 格式不对：应以 sk- 开头（当前只有 %d 位）；请到 platform.deepseek.com/api_keys 复制完整 Key 再粘贴",
-                  (int)strlen(key));
-        msg[sizeof(msg) - 1] = 0;
-        set_err(err, cap_err, msg);
-        return 0;
-    }
-    if (!base || !base[0]) base = DEF_API_BASE;
-    if (currency && cap_cur) currency[0] = 0;
-    if (total && cap_total) total[0] = 0;
-
-    wchar_t *wbase = cw_w_from_u8(base);
-    wchar_t *wkey  = cw_w_from_u8(key);
-    if (!wbase || !wkey) {
-        free(wbase); free(wkey);
-        set_err(err, cap_err, "参数编码失败");
-        return 0;
-    }
-
-    URL_COMPONENTS uc;
-    memset(&uc, 0, sizeof(uc));
-    uc.dwStructSize = sizeof(uc);
-    wchar_t host[256] = {0};
-    wchar_t path[1024] = {0};
-    uc.lpszHostName = host;  uc.dwHostNameLength = 255;
-    uc.lpszUrlPath = path;   uc.dwUrlPathLength = 1023;
-    if (!WinHttpCrackUrl(wbase, 0, 0, &uc)) {
-        set_err(err, cap_err, "api_base 地址无效");
-        free(wbase); free(wkey);
-        return 0;
-    }
-    int secure = (uc.nScheme == INTERNET_SCHEME_HTTPS);
-
-    /* 去掉尾部斜杠再拼 /user/balance */
-    size_t plen = wcslen(path);
-    while (plen > 0 && path[plen - 1] == L'/') path[--plen] = 0;
-    wchar_t full[1200];
-    _snwprintf(full, 1200, L"%s/user/balance", path);
-    full[1199] = 0;
-
-    HINTERNET ses = WinHttpOpen(L"DeepSeekWidget/1.0",
-                                use_proxy ? WINHTTP_ACCESS_TYPE_DEFAULT_PROXY
-                                          : WINHTTP_ACCESS_TYPE_NO_PROXY,
-                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!ses) { set_err(err, cap_err, "WinHTTP 初始化失败"); free(wbase); free(wkey); return 0; }
-    WinHttpSetTimeouts(ses, 15000, 15000, 15000, 20000);
-
-    HINTERNET con = WinHttpConnect(ses, host, uc.nPort, 0);
-    if (!con) {
-        set_err(err, cap_err, "连不上服务器（检查网络/代理）");
-        WinHttpCloseHandle(ses); free(wbase); free(wkey);
-        return 0;
-    }
-    HINTERNET req = WinHttpOpenRequest(con, L"GET", full, NULL, WINHTTP_NO_REFERER,
-                                       WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                       secure ? WINHTTP_FLAG_SECURE : 0);
-    int ok = 0;
-    if (req) {
-        wchar_t hdr[1200];
-        _snwprintf(hdr, 1200, L"Authorization: Bearer %s", wkey);
-        hdr[1199] = 0;
-        WinHttpAddRequestHeaders(req, hdr, -1L,
-                                 WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-        if (!WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
-            set_err(err, cap_err, "请求发送失败（网络不通或代理异常）");
-        } else if (!WinHttpReceiveResponse(req, NULL)) {
-            set_err(err, cap_err, "没收到响应（超时或被代理拦下）");
-        } else {
-            DWORD status = 0, slen = sizeof(status);
-            WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                                WINHTTP_HEADER_NAME_BY_INDEX, &status, &slen, WINHTTP_NO_HEADER_INDEX);
-            char *body = (char *)malloc(65536);
-            DWORD used = 0;
-            if (body) {
-                for (;;) {
-                    DWORD avail = 0;
-                    if (!WinHttpQueryDataAvailable(req, &avail) || avail == 0) break;
-                    if (used + avail > 65000) avail = 65000 - used;
-                    DWORD got = 0;
-                    if (!WinHttpReadData(req, body + used, avail, &got) || got == 0) break;
-                    used += got;
-                    if (used >= 65000) break;
-                }
-                body[used] = 0;
-            }
-            if (status == 200 && body) {
-                if (pick_str(body, "currency", currency, cap_cur) &&
-                    pick_str(body, "total_balance", total, cap_total)) {
-                    pick_str(body, "granted_balance", granted, cap_granted);
-                    pick_str(body, "topped_up_balance", topped, cap_topped);
-                    if (!currency[0]) lstrcpynA(currency, "CNY", cap_cur);
-                    ok = 1;
-                } else {
-                    set_err(err, cap_err, "接口未返回余额信息");
-                }
-            } else if (status == 401 || status == 403) {
-                set_err(err, cap_err, "DeepSeek 拒绝了这个 API Key（401），请重新生成一个再粘贴");
-            } else {
-                char msg[128];
-                _snprintf(msg, sizeof(msg), "接口返回 HTTP %lu", (unsigned long)status);
-                msg[sizeof(msg) - 1] = 0;
-                set_err(err, cap_err, msg);
-            }
-            free(body);
-        }
-        WinHttpCloseHandle(req);
-    } else {
-        set_err(err, cap_err, "创建请求失败");
-    }
-    WinHttpCloseHandle(con);
-    WinHttpCloseHandle(ses);
-    free(wbase);
-    free(wkey);
-    return ok;
 }
 
 /* ---------------------------------------------------------------- 倒计时 */

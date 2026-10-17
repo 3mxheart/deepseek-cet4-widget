@@ -1,5 +1,14 @@
 {
-  "deepseek_api_key": "",
+  "providers": [
+    { "name": "DeepSeek", "type": "deepseek", "api_key": "", "url": "", "headers": "",
+      "json_path": "", "prefix": "", "enabled": true },
+    { "name": "Kimi (月之暗面)", "type": "moonshot", "api_key": "", "url": "", "headers": "",
+      "json_path": "", "prefix": "", "enabled": false },
+    { "name": "我的中转站", "type": "http", "api_key": "", "url": "https://example.com/api/balance",
+      "headers": "", "json_path": "data.balance", "prefix": "¥", "enabled": false }
+  ],
+  "show_only_charged": true,
+  "charged_hold_minutes": 60,
   "api_base": "https://api.deepseek.com",
   "use_system_proxy": true,
   "balance_refresh_seconds": 30,
@@ -11,6 +20,7 @@
     { "name": "CET-4", "datetime": "2027-06-12 09:00" }
   ],
   "background_image": "",
+  "tray_icon": "",
   "window": {
     "width": 360,
     "height": 112,
