@@ -315,12 +315,15 @@ void cw_load_config(void)
     const char *pv = cw_jfind(buf, "providers");
     int have_providers = 0;
     if (pv && *pv == '[') {
+        const char *arr_end = strchr(pv, ']');   /* 数组边界：别把后面的 exams/window 也吞了 */
         g_cfg.provider_count = 0;
         const char *pp = pv;
-        while (*pp && g_cfg.provider_count < CW_MAX_PROVIDERS) {
+        while (*pp && g_cfg.provider_count < CW_MAX_PROVIDERS &&
+               (!arr_end || pp < arr_end)) {
             const char *ob = strchr(pp, '{');
-            const char *cb = ob ? strchr(ob, '}') : NULL;
-            if (!ob || !cb) break;
+            if (!ob || (arr_end && ob >= arr_end)) break;
+            const char *cb = strchr(ob, '}');
+            if (!cb || (arr_end && cb > arr_end)) break;
             int blen = (int)(cb - ob);
             if (blen > 0 && blen < 4000) {
                 char *block = (char *)malloc((size_t)blen + 1);
@@ -365,12 +368,14 @@ void cw_load_config(void)
     /* 考试列表 */
     const char *ex = cw_jfind(buf, "exams");
     if (ex && *ex == '[') {
+        const char *arr_end = strchr(ex, ']');
         g_cfg.exam_count = 0;
         const char *p = ex;
-        while (*p && g_cfg.exam_count < CW_MAX_EXAMS) {
+        while (*p && g_cfg.exam_count < CW_MAX_EXAMS && (!arr_end || p < arr_end)) {
             const char *ob = strchr(p, '{');
-            const char *cb = ob ? strchr(ob, '}') : NULL;
-            if (!ob || !cb) break;
+            if (!ob || (arr_end && ob >= arr_end)) break;
+            const char *cb = strchr(ob, '}');
+            if (!cb || (arr_end && cb > arr_end)) break;
             int blen = (int)(cb - ob);
             if (blen > 0 && blen < 500) {
                 char block[512];
