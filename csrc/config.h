@@ -83,6 +83,7 @@ typedef struct {
 
     Exam   exams[CW_MAX_EXAMS];
     int    exam_count;
+    double bg_x, bg_y;
 } Config;
 
 extern Config  g_cfg;
@@ -99,7 +100,7 @@ void     cw_hex_to_rgb(const char *hex, BYTE *r, BYTE *g, BYTE *b, BYTE def_r, B
 
 /* 配置 */
 void     cw_load_config(void);
-void     cw_save_config(void);
+int      cw_save_config(void);
 
 /* 极简 JSON 取值（只针对本程序自己的 config.json，够用不炫技） */
 const char *cw_jfind(const char *json, const char *key);

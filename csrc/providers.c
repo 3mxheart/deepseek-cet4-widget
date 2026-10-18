@@ -212,14 +212,6 @@ int cw_provider_fetch(const Provider *p, int use_proxy,
         set_err(err, cap_err, "还没有填 API Key");
         return 0;
     }
-    if (!is_http && strncmp(key, "sk-", 3) != 0) {
-        char msg[220];
-        _snprintf(msg, sizeof(msg),
-                  "API Key 看起来不完整：应以 sk- 开头（当前 %d 位）", (int)strlen(key));
-        msg[sizeof(msg) - 1] = 0;
-        set_err(err, cap_err, msg);
-        return 0;
-    }
 
     char url[1024] = {0};
     if (lstrcmpiA(type, "deepseek") == 0) {
@@ -240,6 +232,7 @@ int cw_provider_fetch(const Provider *p, int use_proxy,
     }
 
     char hdrs[1200] = {0};
+    if (p->url[0]) lstrcpynA(url, p->url, sizeof(url));
     if (key && key[0]) {
         _snprintf(hdrs, sizeof(hdrs), "Authorization: Bearer %s", key);
         hdrs[sizeof(hdrs) - 1] = 0;

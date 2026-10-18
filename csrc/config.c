@@ -10,12 +10,18 @@
 #include <string.h>
 
 #include <winhttp.h>
+#include <wincrypt.h>
 
 Config  g_cfg;
 wchar_t g_dirw[MAX_PATH] = {0};
 char    g_dir[MAX_PATH * 2] = {0};
 
 #define DEF_API_BASE "https://api.deepseek.com"
+#ifndef CW_SETTINGS_KEY
+#define CW_SETTINGS_KEY L"Software\\DeepSeekWidget"
+#endif
+
+static int settings_read_failed = 0;
 
 /* ---------------------------------------------------------------- 基础工具 */
 char *cw_u8_from_w(const wchar_t *w)
@@ -56,37 +62,7 @@ void cw_full_path(wchar_t *out, size_t cap, const wchar_t *file)
     out[cap - 1] = 0;
 }
 
-void cw_log(const char *fmt, ...)
-{
-    wchar_t path[MAX_PATH];
-    cw_full_path(path, MAX_PATH, L"widget.log");
-
-    /* 超过 256KB 就截掉前面，避免无限增长 */
-    HANDLE probe = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (probe != INVALID_HANDLE_VALUE) {
-        LARGE_INTEGER size;
-        if (GetFileSizeEx(probe, &size) && size.QuadPart > 256 * 1024) {
-            CloseHandle(probe);
-            DeleteFileW(path);
-        } else {
-            CloseHandle(probe);
-        }
-    }
-
-    FILE *fp = _wfopen(path, L"ab");
-    if (!fp) return;
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    fprintf(fp, "[%04d-%02d-%02d %02d:%02d:%02d] ", st.wYear, st.wMonth, st.wDay,
-            st.wHour, st.wMinute, st.wSecond);
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(fp, fmt, ap);
-    va_end(ap);
-    fprintf(fp, "\n");
-    fclose(fp);
-}
+void cw_log(const char *fmt, ...) { (void)fmt; }
 
 void cw_hex_to_rgb(const char *hex, BYTE *r, BYTE *g, BYTE *b,
                    BYTE def_r, BYTE def_g, BYTE def_b)
@@ -218,6 +194,7 @@ static void defaults(void)
     lstrcpynA(g_cfg.exams[1].name, "CET-4", sizeof(g_cfg.exams[1].name));
     lstrcpynA(g_cfg.exams[1].datetime, "2027-06-12 09:00", sizeof(g_cfg.exams[1].datetime));
     g_cfg.exam_count = 2;
+    g_cfg.bg_x = g_cfg.bg_y = 0.5;
 }
 
 static void parse_datetime(const char *s, SYSTEMTIME *out)
@@ -249,13 +226,46 @@ static time_t st_to_time(const SYSTEMTIME *st)
 void cw_load_config(void)
 {
     defaults();
+    HKEY settings;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, CW_SETTINGS_KEY, 0, KEY_READ, &settings) == ERROR_SUCCESS) {
+        DWORD size = 0, type = 0;
+        if (RegQueryValueExW(settings, L"SettingsV1", NULL, &type, NULL, &size) == ERROR_SUCCESS &&
+            type == REG_BINARY && size < 1024 * 1024) {
+            BYTE *data = (BYTE *)malloc(size);
+            if (data && RegQueryValueExW(settings,L"SettingsV1",NULL,&type,data,&size)==ERROR_SUCCESS) {
+                DATA_BLOB in = {size,data}, out = {0};
+                if (CryptUnprotectData(&in,NULL,NULL,NULL,NULL,CRYPTPROTECT_UI_FORBIDDEN,&out)) {
+                    if (out.cbData == sizeof(Config)) {
+                        memcpy(&g_cfg,out.pbData,sizeof(Config));
+                        LocalFree(out.pbData); free(data); RegCloseKey(settings); return;
+                    }
+                    LocalFree(out.pbData);
+                }
+            }
+            free(data);
+        }
+        RegCloseKey(settings);
+        MessageBoxW(NULL,L"用户设置无法解密或版本不兼容。为保护原配置，本次不会覆盖设置。",L"配置读取失败",MB_OK|MB_ICONWARNING);
+        settings_read_failed = 1;
+        return;
+    }
+    for (int i = 0; i < g_cfg.exam_count; ++i) {
+        SYSTEMTIME st;
+        parse_datetime(g_cfg.exams[i].datetime, &st);
+        g_cfg.exams[i].t = st_to_time(&st);
+    }
 
     wchar_t path[MAX_PATH];
     cw_full_path(path, MAX_PATH, L"config.json");
     FILE *fp = _wfopen(path, L"rb");
     if (!fp) {
-        cw_log("没有找到 config.json，使用默认配置并生成一份");
-        cw_save_config();
+        DWORD attrs = GetFileAttributesW(path);
+        if (attrs == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND) {
+            cw_log("没有找到 config.json，使用默认配置并生成一份");
+            cw_save_config();
+        } else {
+            cw_log("config.json 无法读取，保留原文件，本次不保存配置");
+        }
         return;
     }
     fseek(fp, 0, SEEK_END);
@@ -266,7 +276,9 @@ void cw_load_config(void)
     if (!buf) { fclose(fp); return; }
     size_t got = fread(buf, 1, (size_t)len, fp);
     buf[got] = 0;
+    int read_ok = !ferror(fp) && got == (size_t)len;
     fclose(fp);
+    if (!read_ok) { free(buf); return; }
 
     cw_jstr(buf, "deepseek_api_key", g_cfg.api_key, sizeof(g_cfg.api_key));
     cw_jstr(buf, "api_base", g_cfg.api_base, sizeof(g_cfg.api_base));
@@ -350,7 +362,7 @@ void cw_load_config(void)
         have_providers = (g_cfg.provider_count > 0);
     }
     /* 老配置兼容：没有 providers 就按 deepseek_api_key 造一个 */
-    if (!have_providers) {
+    if (!have_providers && !(pv && *pv == '[')) {
         g_cfg.provider_count = 1;
         memset(&g_cfg.providers[0], 0, sizeof(Provider));
         lstrcpynA(g_cfg.providers[0].name, "DeepSeek", sizeof(g_cfg.providers[0].name));
@@ -403,87 +415,24 @@ void cw_load_config(void)
                 g_cfg.exams[j] = tmp;
             }
     free(buf);
+    cw_save_config(); /* One-time import of the old adjacent JSON. */
 }
 
-void cw_save_config(void)
+int cw_save_config(void)
 {
-    wchar_t path[MAX_PATH];
-    cw_full_path(path, MAX_PATH, L"config.json");
-    FILE *fp = _wfopen(path, L"wb");
-    if (!fp) { cw_log("配置保存失败（目录不可写？）"); return; }
-
-    char base[600], bg[2100], font[200];
-    cw_jesc(base, sizeof(base), g_cfg.api_base);
-    cw_jesc(bg, sizeof(bg), g_cfg.bg_image);
-    cw_jesc(font, sizeof(font), g_cfg.font_family);
-
-    fprintf(fp, "{\n");
-    fprintf(fp, "  \"api_base\": \"%s\",\n", base);
-    fprintf(fp, "  \"use_system_proxy\": %s,\n", g_cfg.use_proxy ? "true" : "false");
-    fprintf(fp, "  \"balance_refresh_seconds\": %d,\n", g_cfg.refresh_seconds);
-    fprintf(fp, "  \"show_only_charged\": %s,\n", g_cfg.show_only_charged ? "true" : "false");
-    fprintf(fp, "  \"charged_hold_minutes\": %d,\n", g_cfg.charged_hold_minutes);
-    fprintf(fp, "  \"providers\": [\n");
-    for (int i = 0; i < g_cfg.provider_count; i++) {
-        const Provider *p = &g_cfg.providers[i];
-        char nm[120], ty[40], k[1100], u[1100], h[1100], jp[300], px[40];
-        cw_jesc(nm, sizeof(nm), p->name);
-        cw_jesc(ty, sizeof(ty), p->type);
-        cw_jesc(k, sizeof(k), p->api_key);
-        cw_jesc(u, sizeof(u), p->url);
-        cw_jesc(h, sizeof(h), p->headers);
-        cw_jesc(jp, sizeof(jp), p->json_path);
-        cw_jesc(px, sizeof(px), p->prefix);
-        fprintf(fp, "    { \"name\": \"%s\", \"type\": \"%s\", \"api_key\": \"%s\", "
-                    "\"url\": \"%s\", \"headers\": \"%s\", \"json_path\": \"%s\", "
-                    "\"prefix\": \"%s\", \"enabled\": %s }%s\n",
-                nm, ty, k, u, h, jp, px, p->enabled ? "true" : "false",
-                (i == g_cfg.provider_count - 1) ? "" : ",");
+    if (settings_read_failed) return 0;
+    DATA_BLOB in = {sizeof(Config), (BYTE *)&g_cfg}, out = {0};
+    if (!CryptProtectData(&in,L"DeepSeekWidget",NULL,NULL,NULL,CRYPTPROTECT_UI_FORBIDDEN,&out)) return 0;
+    HKEY key;
+    LONG rc = RegCreateKeyExW(HKEY_CURRENT_USER,CW_SETTINGS_KEY,0,NULL,0,KEY_SET_VALUE,NULL,&key,NULL);
+    if (rc == ERROR_SUCCESS) {
+        rc = RegSetValueExW(key,L"SettingsV1",0,REG_BINARY,out.pbData,out.cbData);
+        RegCloseKey(key);
     }
-    fprintf(fp, "  ],\n");
-    fprintf(fp, "  \"show_delta\": %s,\n", g_cfg.show_delta ? "true" : "false");
-    fprintf(fp, "  \"delta_hold_seconds\": %d,\n", g_cfg.delta_hold_seconds);
-    fprintf(fp, "  \"show_status_line\": %s,\n", g_cfg.show_status_line ? "true" : "false");
-    fprintf(fp, "  \"exams\": [\n");
-    for (int i = 0; i < g_cfg.exam_count; i++) {
-        char nm[100], dt[100];
-        cw_jesc(nm, sizeof(nm), g_cfg.exams[i].name);
-        cw_jesc(dt, sizeof(dt), g_cfg.exams[i].datetime);
-        fprintf(fp, "    { \"name\": \"%s\", \"datetime\": \"%s\" }%s\n", nm, dt,
-                (i == g_cfg.exam_count - 1) ? "" : ",");
-    }
-    fprintf(fp, "  ],\n");
-    fprintf(fp, "  \"background_image\": \"%s\",\n", bg);
-    {
-        char ti[2100];
-        cw_jesc(ti, sizeof(ti), g_cfg.tray_icon);
-        fprintf(fp, "  \"tray_icon\": \"%s\",\n", ti);
-    }
-    fprintf(fp, "  \"window\": {\n");
-    fprintf(fp, "    \"width\": %d,\n    \"height\": %d,\n", g_cfg.w, g_cfg.h);
-    if (g_cfg.has_pos) {
-        fprintf(fp, "    \"x\": %d,\n    \"y\": %d,\n", g_cfg.x, g_cfg.y);
-    } else {
-        fprintf(fp, "    \"x\": null,\n    \"y\": null,\n");
-    }
-    fprintf(fp, "    \"opacity\": %.2f,\n    \"rounded\": %d,\n", g_cfg.opacity, g_cfg.rounded);
-    fprintf(fp, "    \"topmost\": %s,\n", g_cfg.topmost ? "true" : "false");
-    fprintf(fp, "    \"transparent\": true\n  },\n");
-    fprintf(fp, "  \"appearance\": {\n");
-    fprintf(fp, "    \"scrim_alpha\": %d,\n", g_cfg.scrim_alpha);
-    fprintf(fp, "    \"text_shadow\": true,\n");
-    fprintf(fp, "    \"font_family\": \"%s\",\n", font);
-    fprintf(fp, "    \"value_size\": %d,\n    \"label_size\": %d,\n    \"detail_size\": %d,\n",
-            g_cfg.value_size, g_cfg.label_size, g_cfg.detail_size);
-    fprintf(fp, "    \"label_color\": \"%s\",\n", g_cfg.label_color);
-    fprintf(fp, "    \"value_color\": \"%s\",\n", g_cfg.value_color);
-    fprintf(fp, "    \"detail_color\": \"%s\",\n", g_cfg.detail_color);
-    fprintf(fp, "    \"accent_color\": \"%s\"\n  },\n", g_cfg.accent_color);
-    fprintf(fp, "  \"lock_position\": %s,\n", g_cfg.lock_position ? "true" : "false");
-    fprintf(fp, "  \"show_balance_detail\": %s\n", g_cfg.show_balance_detail ? "true" : "false");
-    fprintf(fp, "}\n");
-    fclose(fp);
+    LocalFree(out.pbData);
+    return rc == ERROR_SUCCESS;
 }
+
 
 /* ---------------------------------------------------------------- 倒计时 */
 void cw_countdown(char *value, int cap_v, char *detail, int cap_d)

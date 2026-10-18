@@ -23,7 +23,7 @@ enum {
     IDM_REFRESH = 1001, IDM_SETKEY, IDM_OPENFOLDER, IDM_EDITCFG, IDM_PICKBG,
     IDM_CLEARBG, IDM_PICKTRAY, IDM_DEFAULTTRAY,
     IDM_OPACITY_UP, IDM_OPACITY_DOWN, IDM_LOCK, IDM_STARTUP, IDM_EXIT,
-    IDM_HIDE, IDM_ONLY_CHARGED,
+    IDM_HIDE, IDM_ONLY_CHARGED, IDM_PROVIDERS,
     IDM_FREQ_BASE = 1100,
     IDM_IDC_KEY_OK = 1200, IDM_IDC_KEY_CANCEL
 };
@@ -258,6 +258,7 @@ static void build_texts(Texts *t)
 static Bitmap *g_bg_scaled = NULL;
 static char    g_bg_path[1024] = "";
 static int     g_bg_w = 0, g_bg_h = 0;
+static double g_bg_x = -1, g_bg_y = -1;
 
 static void free_bg_cache(void)
 {
@@ -269,12 +270,13 @@ static void free_bg_cache(void)
 static Bitmap *background_scaled(int W, int H)
 {
     if (g_bg_scaled && g_bg_w == W && g_bg_h == H
-        && lstrcmpA(g_bg_path, g_cfg.bg_image) == 0)
+        && lstrcmpA(g_bg_path, g_cfg.bg_image) == 0 && g_bg_x == g_cfg.bg_x && g_bg_y == g_cfg.bg_y)
         return g_bg_scaled;
     if (g_bg_scaled) { delete g_bg_scaled; g_bg_scaled = NULL; }
     lstrcpynA(g_bg_path, g_cfg.bg_image, sizeof(g_bg_path));
     g_bg_w = W;
     g_bg_h = H;
+    g_bg_x = g_cfg.bg_x; g_bg_y = g_cfg.bg_y;
     if (!g_bg_path[0]) return NULL;
 
     wchar_t *wp = cw_w_from_u8(g_bg_path);
@@ -296,7 +298,7 @@ static Bitmap *background_scaled(int W, int H)
         float sw = (float)src.GetWidth(), sh = (float)src.GetHeight();
         float scale = ((float)W / sw > (float)H / sh) ? (float)W / sw : (float)H / sh;
         float dw = sw * scale, dh = sh * scale;
-        float dx = ((float)W - dw) / 2.0f, dy = ((float)H - dh) / 2.0f;
+        float dx = ((float)W - dw) * (float)g_cfg.bg_x, dy = ((float)H - dh) * (float)g_cfg.bg_y;
         g.DrawImage(&src, RectF(dx, dy, dw, dh), 0, 0, sw, sh, UnitPixel);
     }
     g_bg_scaled = out;
@@ -694,6 +696,23 @@ static LRESULT CALLBACK KeyDlgProc(HWND h, UINT m, WPARAM w, LPARAM l)
     return DefWindowProcW(h, m, w, l);
 }
 
+#include "provider_dialog.h"
+
+static void show_provider_dialog(void)
+{
+    HWND h = CreateWindowExW(WS_EX_DLGMODALFRAME, L"CWProviderDlg", L"管理 API / 中转站",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 666, 548,
+        g_hwnd, NULL, g_inst, NULL);
+    if (!h) return;
+    EnableWindow(g_hwnd, FALSE);
+    ShowWindow(h, SW_SHOW);
+    MSG msg;
+    while (IsWindow(h) && GetMessageW(&msg, NULL, 0, 0)) {
+        if (!IsDialogMessageW(h, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    }
+    EnableWindow(g_hwnd, TRUE);
+}
+
 static void show_key_dialog(void)
 {
     RECT rc;
@@ -920,6 +939,7 @@ static void show_menu(int trayMode)
     AppendMenuW(menu, MF_STRING | (g_cfg.show_only_charged ? MF_CHECKED : 0),
                 IDM_ONLY_CHARGED, L"只显示最近扣费的服务商");
     AppendMenuW(menu, MF_STRING, IDM_SETKEY, L"设置 API Key…");
+    AppendMenuW(menu, MF_STRING, IDM_PROVIDERS, L"管理 API / 中转站…");
     for (int i = 0; i < FREQ_COUNT; i++) {
         char label[32];
         if (kFreqs[i] >= 60) cw_fmt(label, sizeof(label), "%d 分钟", kFreqs[i] / 60);
@@ -938,7 +958,7 @@ static void show_menu(int trayMode)
     AppendMenuW(menu, MF_STRING, IDM_PICKTRAY, L"更换托盘图标…");
     AppendMenuW(menu, MF_STRING, IDM_DEFAULTTRAY, L"恢复默认托盘图标");
     AppendMenuW(menu, MF_STRING, IDM_OPENFOLDER, L"打开所在文件夹");
-    AppendMenuW(menu, MF_STRING, IDM_EDITCFG, L"编辑配置文件");
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"按住 Shift 拖动：调整背景裁剪位置");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, IDM_OPACITY_UP, L"不透明度 +");
     AppendMenuW(menu, MF_STRING, IDM_OPACITY_DOWN, L"不透明度 −");
@@ -969,6 +989,9 @@ static void show_menu(int trayMode)
         break;
     case IDM_SETKEY:
         show_key_dialog();
+        break;
+    case IDM_PROVIDERS:
+        show_provider_dialog();
         break;
     case IDM_PICKBG:
         pick_background();
@@ -1031,10 +1054,17 @@ static void show_menu(int trayMode)
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     static int dragging = 0;
+    static int crop_drag = 0;
+    static POINT crop_start;
+    static double crop_x, crop_y;
     static POINT drag_off;
 
     switch (m) {
     case WM_LBUTTONDOWN:
+        if ((GetKeyState(VK_SHIFT)&0x8000) && g_cfg.bg_image[0]) {
+            crop_drag=1; GetCursorPos(&crop_start); crop_x=g_cfg.bg_x; crop_y=g_cfg.bg_y;
+            SetCapture(h); return 0;
+        }
         if (!g_cfg.lock_position) {
             POINT pt;
             GetCursorPos(&pt);
@@ -1047,6 +1077,16 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         return 0;
     case WM_MOUSEMOVE:
+        if (crop_drag) {
+            POINT p; GetCursorPos(&p);
+            g_cfg.bg_x = crop_x - (double)(p.x-crop_start.x)/300.0;
+            g_cfg.bg_y = crop_y - (double)(p.y-crop_start.y)/300.0;
+            if(g_cfg.bg_x<0)g_cfg.bg_x=0;
+            if(g_cfg.bg_x>1)g_cfg.bg_x=1;
+            if(g_cfg.bg_y<0)g_cfg.bg_y=0;
+            if(g_cfg.bg_y>1)g_cfg.bg_y=1;
+            render_if_changed(1); return 0;
+        }
         if (dragging) {
             POINT pt;
             GetCursorPos(&pt);
@@ -1055,11 +1095,16 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         return 0;
     case WM_LBUTTONUP:
+        if(crop_drag) {crop_drag=0; ReleaseCapture(); cw_save_config(); return 0;}
         if (dragging) {
             dragging = 0;
             ReleaseCapture();
             save_pos();
         }
+        return 0;
+    case WM_CAPTURECHANGED:
+        if(crop_drag) {crop_drag=0; cw_save_config();}
+        dragging=0;
         return 0;
     case WM_LBUTTONDBLCLK:
         SetEvent(g_ev_refresh);
@@ -1142,15 +1187,22 @@ static DWORD WINAPI WorkerProc(LPVOID)
         LeaveCriticalSection(&g_lock);
 
         /* 逐个服务商查，谁掉钱了谁就会被显示出来 */
-        for (int i = 0; i < g_cfg.provider_count && i < CW_MAX_PROVIDERS; i++) {
-            const Provider *p = &g_cfg.providers[i];
+        EnterCriticalSection(&g_lock);
+        Config snapshot = g_cfg;
+        LeaveCriticalSection(&g_lock);
+        for (int i = 0; i < snapshot.provider_count && i < CW_MAX_PROVIDERS; i++) {
+            const Provider *p = &snapshot.providers[i];
             if (!p->enabled) continue;
 
             char tot[64] = {0}, pfx[16] = {0}, extra[128] = {0}, err[256] = {0};
-            int ok = cw_provider_fetch(p, g_cfg.use_proxy, tot, sizeof(tot),
+            int ok = cw_provider_fetch(p, snapshot.use_proxy, tot, sizeof(tot),
                                        pfx, sizeof(pfx), extra, sizeof(extra),
                                        err, sizeof(err));
             EnterCriticalSection(&g_lock);
+            if (i >= g_cfg.provider_count || memcmp(p, &g_cfg.providers[i], sizeof(Provider))) {
+                LeaveCriticalSection(&g_lock);
+                continue;
+            }
             PState *st = &g_ps[i];
             if (ok) {
                 double nv = parse_total(tot);
@@ -1268,6 +1320,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int)
     dc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     dc.lpszClassName = L"CWKeyDlg";
     if (!RegisterClassExW(&dc)) cw_log("注册对话框类失败: %lu", GetLastError());
+    dc.lpfnWndProc = ProviderDlgProc;
+    dc.lpszClassName = L"CWProviderDlg";
+    RegisterClassExW(&dc);
 
     int W = g_cfg.w, H = g_cfg.h;
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
@@ -1298,6 +1353,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int)
     SetEvent(g_ev_refresh);
 
     if (cmdline && wcsstr(cmdline, L"--keydlg")) show_key_dialog();
+    if (cmdline && wcsstr(cmdline, L"--providers")) show_provider_dialog();
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {

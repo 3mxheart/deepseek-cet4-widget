@@ -75,7 +75,7 @@ $raw = Join-Path $src "DeepSeekWidget.exe"
 & $gpp -municode -mwindows -static -s -o $raw `
     (Join-Path $src "config.o") (Join-Path $src "providers.o") (Join-Path $src "ui.o") `
     (Join-Path $src "app.rc") `
-    -lwinhttp -lgdiplus -lcomdlg32 -lshell32 -ladvapi32 -lole32 -luser32 -lgdi32
+    -lwinhttp -lgdiplus -lcomdlg32 -lshell32 -ladvapi32 -lcrypt32 -lole32 -luser32 -lgdi32
 if ($LASTEXITCODE -ne 0) { throw "链接失败" }
 
 # 产物和 config.json 放同一层：两个版本共用同一份配置
@@ -95,4 +95,4 @@ Move-Item -LiteralPath $raw -Destination $final
 $size = [math]::Round((Get-Item -LiteralPath $final).Length / 1KB, 1)
 Write-Output ""
 Write-Output "编译完成：$final（$size KB）"
-Write-Output "提示：config.json / widget.log 会放在 exe 旁边；移动 exe 后重新勾一次“开机自动启动”。"
+Write-Output "提示：配置加密保存在当前用户注册表，不生成 JSON 或日志；移动 exe 后重新勾一次开机自动启动。"
